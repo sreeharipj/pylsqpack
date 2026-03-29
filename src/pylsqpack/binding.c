@@ -68,6 +68,7 @@ static void header_block_unblocked(void *opaque) {
  */
 static struct lsxpack_header *header_block_prepare_decode(void *opaque, struct lsxpack_header *xhdr, size_t space) {
     struct header_block *hblock = opaque;
+    if (space == 0) return NULL;
     char *buf = realloc(hblock->header_buffer, space);
     if (!buf) return NULL;
     hblock->header_buffer = buf;
@@ -431,11 +432,7 @@ Encoder_encode(EncoderObject *self, PyObject *args, PyObject *kwargs)
         return NULL;
     }
 
-    if (lsqpack_enc_start_header(&self->enc, stream_id, seqno) != 0) {
-        PyErr_SetString(PyExc_RuntimeError, "lsqpack_enc_start_header failed");
-        return NULL;
-    }
-
+    // Validate all headers before starting the encoding transaction.
     for (Py_ssize_t i = 0; i < PyList_Size(list); ++i) {
         tuple = PyList_GetItem(list, i);
         if (!PyTuple_Check(tuple) || PyTuple_Size(tuple) != 2) {
@@ -450,12 +447,29 @@ Encoder_encode(EncoderObject *self, PyObject *args, PyObject *kwargs)
         }
         name_len = PyBytes_Size(name);
         value_len = PyBytes_Size(value);
+        if (name_len == 0) {
+            PyErr_SetString(PyExc_ValueError, "header name must not be empty");
+            return NULL;
+        }
         if (name_len + value_len > XHDR_BUF_SZ) {
             PyErr_SetString(PyExc_ValueError, "the header's name and value are too long");
             return NULL;
         }
+    }
 
-        // Copy the header name and value into the xhdr buffer.
+    // All inputs valid — now start the encoding transaction.
+    if (lsqpack_enc_start_header(&self->enc, stream_id, seqno) != 0) {
+        PyErr_SetString(PyExc_RuntimeError, "lsqpack_enc_start_header failed");
+        return NULL;
+    }
+
+    for (Py_ssize_t i = 0; i < PyList_Size(list); ++i) {
+        tuple = PyList_GetItem(list, i);
+        name = PyTuple_GetItem(tuple, 0);
+        value = PyTuple_GetItem(tuple, 1);
+        name_len = PyBytes_Size(name);
+        value_len = PyBytes_Size(value);
+
         memcpy(self->xhdr_buf, PyBytes_AsString(name), name_len);
         memcpy(self->xhdr_buf + name_len, PyBytes_AsString(value), value_len);
         lsxpack_header_set_offset2(&xhdr, self->xhdr_buf, 0, name_len, name_len, value_len);
@@ -468,6 +482,7 @@ Encoder_encode(EncoderObject *self, PyObject *args, PyObject *kwargs)
                                &xhdr,
                                0) != LQES_OK) {
             PyErr_SetString(PyExc_RuntimeError, "lsqpack_enc_encode failed");
+            lsqpack_enc_end_header(&self->enc, self->pfx_buf, PREFIX_MAX_SIZE, NULL);
             return NULL;
         }
         enc_off += enc_len;
@@ -476,7 +491,7 @@ Encoder_encode(EncoderObject *self, PyObject *args, PyObject *kwargs)
 
     pfx_len = lsqpack_enc_end_header(&self->enc, self->pfx_buf, PREFIX_MAX_SIZE, NULL);
     if (pfx_len <= 0) {
-        PyErr_SetString(PyExc_RuntimeError, "lsqpack_enc_start_header failed");
+        PyErr_SetString(PyExc_RuntimeError, "lsqpack_enc_end_header failed");
         return NULL;
     }
     pfx_off = PREFIX_MAX_SIZE - pfx_len;
